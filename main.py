@@ -28,7 +28,7 @@ def get_client():
 app = FastAPI(
     title="Behavioral Fingerprint",
     description="Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time.",
-    version="0.2.0"
+    version="0.3.0"
 )
 
 app.add_middleware(
@@ -301,7 +301,7 @@ class AgentUpdate(BaseModel):
 def root():
     return {
         "tool": "Behavioral Fingerprint",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "status": "running",
         "description": "Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time."
     }
@@ -670,6 +670,40 @@ def compare_fingerprints(agent_id: str, data: CompareRequest):
 
     stored = r.json()[0] if isinstance(r.json(), list) else r.json()
 
+    # Generate drift alert if drift detected
+    if drift_detected:
+        dimensions_shifted = [
+            dim for dim, delta in zip(
+                ["verbosity", "hedging", "refusal", "confidence", "consistency", "adherence"],
+                deltas
+            ) if delta > 0
+        ]
+        alert_message = (
+            f"Behavioral drift detected on agent '{agent_id}'. "
+            f"Severity: {severity}. "
+            f"Distance: {distance}. "
+            f"Dimensions shifted: {', '.join(dimensions_shifted)}."
+        )
+        alert_record = {
+            "agent_id": agent_id,
+            "drift_record_id": stored["id"],
+            "dimensions_shifted": dimensions_shifted,
+            "message": alert_message,
+            "severity": severity,
+            "acknowledged": False,
+        }
+        with get_client() as client:
+            alert_r = client.post("/drift_alerts", json=alert_record)
+        if alert_r.status_code in (200, 201):
+            alert_data = alert_r.json()
+            alert = alert_data[0] if isinstance(alert_data, list) else alert_data
+            fire_webhooks(agent_id, {
+                "drift_record_id": stored["id"],
+                "severity": severity,
+                "mahalanobis_distance": distance,
+                "compared_at": stored["created_at"],
+            }, alert["id"], dimensions_shifted)
+
     return {
         "drift_record_id": stored["id"],
         "agent_id": agent_id,
@@ -695,3 +729,83 @@ def list_drift_records(agent_id: str):
     with get_client() as client:
         r = client.get(f"/drift_records?agent_id=eq.{agent_id}&order=created_at.desc")
     return r.json()
+
+# ── WEBHOOKS ────────────────────────────
+
+class WebhookCreate(BaseModel):
+    name: str
+    url: str
+    min_severity: Optional[str] = "low"
+
+@app.post("/webhooks")
+def create_webhook(data: WebhookCreate):
+    if data.min_severity not in ("low", "medium", "high", "critical"):
+        raise HTTPException(status_code=400, detail="min_severity must be low, medium, high, or critical")
+    with get_client() as client:
+        r = client.post("/webhooks", json={
+            "name": data.name,
+            "url": data.url,
+            "min_severity": data.min_severity,
+            "active": True,
+        })
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=400, detail=r.text)
+    return r.json()[0] if isinstance(r.json(), list) else r.json()
+
+@app.get("/webhooks")
+def list_webhooks():
+    with get_client() as client:
+        r = client.get("/webhooks?active=eq.true&order=created_at.desc")
+    return r.json()
+
+@app.delete("/webhooks/{webhook_id}")
+def delete_webhook(webhook_id: str):
+    with get_client() as client:
+        r = client.patch(f"/webhooks?id=eq.{webhook_id}", json={"active": False})
+    return {"deactivated": True}
+
+# ── DRIFT ALERTS ─────────────────────────
+
+SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+def fire_webhooks(agent_id: str, drift_record: dict, alert_id: str, dimensions_shifted: list):
+    """Fires all active webhooks whose min_severity is met."""
+    severity = drift_record.get("severity") or "low"
+    with get_client() as client:
+        r = client.get("/webhooks?active=eq.true")
+    webhooks = r.json()
+
+    payload = {
+        "event": "behavioralfingerprint.drift",
+        "agent_id": agent_id,
+        "alert_id": alert_id,
+        "drift_record_id": drift_record["drift_record_id"],
+        "severity": severity,
+        "mahalanobis_distance": drift_record["mahalanobis_distance"],
+        "dimensions_shifted": dimensions_shifted,
+        "compared_at": drift_record["compared_at"],
+    }
+
+    with httpx.Client(timeout=10.0) as http:
+        for webhook in webhooks:
+            webhook_rank = SEVERITY_RANK.get(webhook["min_severity"], 1)
+            alert_rank = SEVERITY_RANK.get(severity, 1)
+            if alert_rank >= webhook_rank:
+                try:
+                    http.post(webhook["url"], json=payload)
+                except Exception:
+                    pass  # never crash the pipeline on webhook failure
+
+@app.get("/alerts/{agent_id}")
+def list_alerts(agent_id: str):
+    with get_client() as client:
+        r = client.get(f"/drift_alerts?agent_id=eq.{agent_id}&order=fired_at.desc")
+    return r.json()
+
+@app.patch("/alerts/{alert_id}/acknowledge")
+def acknowledge_alert(alert_id: str):
+    with get_client() as client:
+        r = client.patch(f"/drift_alerts?id=eq.{alert_id}", json={
+            "acknowledged": True,
+        })
+    return {"acknowledged": True}

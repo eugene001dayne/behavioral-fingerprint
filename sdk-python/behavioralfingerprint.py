@@ -64,3 +64,32 @@ class BehavioralFingerprint:
 
     def health(self):
         return self._req("GET", "/health")
+
+# Drift comparison
+    def compare_fingerprints(self, agent_id: str, fingerprint_a_id: str, fingerprint_b_id: str):
+        return self._req("POST", f"/fingerprint/{agent_id}/compare", json={
+            "fingerprint_a_id": fingerprint_a_id,
+            "fingerprint_b_id": fingerprint_b_id,
+        })
+
+    def list_drift_records(self, agent_id: str):
+        return self._req("GET", f"/drift/{agent_id}")
+
+    # Webhooks
+    def create_webhook(self, name: str, url: str, min_severity: str = "low"):
+        return self._req("POST", "/webhooks", json={
+            "name": name, "url": url, "min_severity": min_severity
+        })
+
+    def list_webhooks(self):
+        return self._req("GET", "/webhooks")
+
+    def delete_webhook(self, webhook_id: str):
+        return self._req("DELETE", f"/webhooks/{webhook_id}")
+
+    # Alerts
+    def list_alerts(self, agent_id: str):
+        return self._req("GET", f"/alerts/{agent_id}")
+
+    def acknowledge_alert(self, alert_id: str):
+        return self._req("PATCH", f"/alerts/{alert_id}/acknowledge")

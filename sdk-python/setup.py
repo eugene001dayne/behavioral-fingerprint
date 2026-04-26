@@ -5,7 +5,7 @@ with open("README.md", "r") as f:
 
 setup(
     name="behavioralfingerprint",
-    version="0.1.0",
+    version="0.3.0",
     description="Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time.",
     long_description=long_description,
     long_description_content_type="text/markdown",

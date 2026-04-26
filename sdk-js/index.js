@@ -35,6 +35,26 @@ class BehavioralFingerprint {
   // Dashboard
   stats() { return this._req("GET", "/dashboard/stats"); }
   health() { return this._req("GET", "/health"); }
+
+  // Drift comparison
+  compareFingerprints(agentId, fingerprintAId, fingerprintBId) {
+    return this._req("POST", `/fingerprint/${agentId}/compare`, {
+      fingerprint_a_id: fingerprintAId,
+      fingerprint_b_id: fingerprintBId,
+    });
+  }
+  listDriftRecords(agentId) { return this._req("GET", `/drift/${agentId}`); }
+
+  // Webhooks
+  createWebhook(name, url, minSeverity = "low") {
+    return this._req("POST", "/webhooks", { name, url, min_severity: minSeverity });
+  }
+  listWebhooks() { return this._req("GET", "/webhooks"); }
+  deleteWebhook(webhookId) { return this._req("DELETE", `/webhooks/${webhookId}`); }
+
+  // Alerts
+  listAlerts(agentId) { return this._req("GET", `/alerts/${agentId}`); }
+  acknowledgeAlert(alertId) { return this._req("PATCH", `/alerts/${alertId}/acknowledge`); }
 }
 
 module.exports = BehavioralFingerprint;
