@@ -28,7 +28,7 @@ def get_client():
 app = FastAPI(
     title="Behavioral Fingerprint",
     description="Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time.",
-    version="0.1.0"
+    version="0.2.0"
 )
 
 app.add_middleware(
@@ -301,7 +301,7 @@ class AgentUpdate(BaseModel):
 def root():
     return {
         "tool": "Behavioral Fingerprint",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "status": "running",
         "description": "Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time."
     }
@@ -573,3 +573,125 @@ def dashboard_stats():
             for fp in recent
         ]
     }
+
+# ── DRIFT DETECTION ─────────────────────
+
+class CompareRequest(BaseModel):
+    fingerprint_a_id: str
+    fingerprint_b_id: str
+
+def compute_delta(a: float, b: float) -> float:
+    """Absolute difference between two dimension scores."""
+    if a is None or b is None:
+        return 0.0
+    return round(abs(a - b), 4)
+
+def compute_mahalanobis(deltas: list) -> float:
+    """
+    Simplified Mahalanobis distance — Euclidean norm of the delta vector.
+    Assumes unit variance per dimension (no covariance matrix at v0.2.0).
+    Replace with full Mahalanobis in a later version when enough fingerprint
+    history exists to estimate the covariance matrix.
+    """
+    return round(math.sqrt(sum(d ** 2 for d in deltas)), 4)
+
+def classify_severity(distance: float) -> tuple:
+    """
+    Returns (drift_detected, severity) based on Mahalanobis distance.
+    Thresholds calibrated for 6-dimension unit-variance space.
+    """
+    if distance < 0.2:
+        return False, None
+    elif distance < 0.4:
+        return True, "low"
+    elif distance < 0.6:
+        return True, "medium"
+    elif distance < 0.8:
+        return True, "high"
+    else:
+        return True, "critical"
+
+@app.post("/fingerprint/{agent_id}/compare")
+def compare_fingerprints(agent_id: str, data: CompareRequest):
+    """
+    Compares two fingerprints for the same agent.
+    Returns per-dimension deltas, overall Mahalanobis distance,
+    drift detected flag, and severity. Stores the drift record.
+    """
+    with get_client() as client:
+        r_a = client.get(f"/fingerprints?id=eq.{data.fingerprint_a_id}&agent_id=eq.{agent_id}")
+        r_b = client.get(f"/fingerprints?id=eq.{data.fingerprint_b_id}&agent_id=eq.{agent_id}")
+
+    fp_a_list = r_a.json()
+    fp_b_list = r_b.json()
+
+    if not fp_a_list:
+        raise HTTPException(status_code=404, detail="Fingerprint A not found for this agent")
+    if not fp_b_list:
+        raise HTTPException(status_code=404, detail="Fingerprint B not found for this agent")
+
+    a = fp_a_list[0]
+    b = fp_b_list[0]
+
+    verbosity_delta   = compute_delta(a["verbosity_score"],   b["verbosity_score"])
+    hedging_delta     = compute_delta(a["hedging_rate"],      b["hedging_rate"])
+    refusal_delta     = compute_delta(a["refusal_rate"],      b["refusal_rate"])
+    confidence_delta  = compute_delta(a["confidence_score"],  b["confidence_score"])
+    consistency_delta = compute_delta(a["consistency_score"], b["consistency_score"])
+    adherence_delta   = compute_delta(a["adherence_score"],   b["adherence_score"])
+
+    deltas = [
+        verbosity_delta, hedging_delta, refusal_delta,
+        confidence_delta, consistency_delta, adherence_delta
+    ]
+
+    distance = compute_mahalanobis(deltas)
+    drift_detected, severity = classify_severity(distance)
+
+    drift_record = {
+        "agent_id": agent_id,
+        "fingerprint_a_id": data.fingerprint_a_id,
+        "fingerprint_b_id": data.fingerprint_b_id,
+        "verbosity_delta":   verbosity_delta,
+        "hedging_delta":     hedging_delta,
+        "refusal_delta":     refusal_delta,
+        "confidence_delta":  confidence_delta,
+        "consistency_delta": consistency_delta,
+        "adherence_delta":   adherence_delta,
+        "mahalanobis_distance": distance,
+        "drift_detected": drift_detected,
+        "severity": severity,
+    }
+
+    with get_client() as client:
+        r = client.post("/drift_records", json=drift_record)
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=f"Failed to store drift record: {r.text}")
+
+    stored = r.json()[0] if isinstance(r.json(), list) else r.json()
+
+    return {
+        "drift_record_id": stored["id"],
+        "agent_id": agent_id,
+        "fingerprint_a_id": data.fingerprint_a_id,
+        "fingerprint_b_id": data.fingerprint_b_id,
+        "deltas": {
+            "verbosity":   verbosity_delta,
+            "hedging":     hedging_delta,
+            "refusal":     refusal_delta,
+            "confidence":  confidence_delta,
+            "consistency": consistency_delta,
+            "adherence":   adherence_delta,
+        },
+        "mahalanobis_distance": distance,
+        "drift_detected": drift_detected,
+        "severity": severity,
+        "compared_at": stored["created_at"],
+    }
+
+@app.get("/drift/{agent_id}")
+def list_drift_records(agent_id: str):
+    """Returns all drift records for an agent, most recent first."""
+    with get_client() as client:
+        r = client.get(f"/drift_records?agent_id=eq.{agent_id}&order=created_at.desc")
+    return r.json()
