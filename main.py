@@ -32,7 +32,7 @@ def get_client():
 app = FastAPI(
     title="Behavioral Fingerprint",
     description="Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time.",
-    version="0.5.0"
+    version="0.6.0"
 )
 
 app.add_middleware(
@@ -305,7 +305,7 @@ class AgentUpdate(BaseModel):
 def root():
     return {
         "tool": "Behavioral Fingerprint",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "status": "running",
         "description": "Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time."
     }
@@ -1171,3 +1171,71 @@ def capture_fingerprint_with_battery(agent_id: str, battery_id: str):
         "errors_on_probes": errors,
         "scores": scores,
     }
+
+# ── THREADWATCH BRIDGE ───────────────────
+
+THREAD_SUITE_URLS = {
+    "iron-thread":   "https://iron-thread.onrender.com",
+    "testthread":    "https://test-thread-cass.onrender.com",
+    "promptthread":  "https://prompt-thread.onrender.com",
+    "chainthread":   "https://chain-thread.onrender.com",
+    "policythread":  "https://policy-thread.onrender.com",
+    "threadwatch":   "https://thread-watch.onrender.com",
+}
+
+class ThreadWatchSignal(BaseModel):
+    agent_id: str
+    drift_record_id: str
+    severity: str
+    mahalanobis_distance: float
+    dimensions_shifted: List[str]
+
+@app.post("/bridge/threadwatch")
+def send_to_threadwatch(data: ThreadWatchSignal):
+    """
+    Sends a behavioral drift signal to ThreadWatch.
+    ThreadWatch can correlate this with signals from other suite tools.
+    """
+    threadwatch_url = THREAD_SUITE_URLS["threadwatch"]
+    payload = {
+        "source_tool": "behavioral-fingerprint",
+        "signal_type": "drift_detected",
+        "payload": {
+            "agent_id": data.agent_id,
+            "drift_record_id": data.drift_record_id,
+            "severity": data.severity,
+            "mahalanobis_distance": data.mahalanobis_distance,
+            "dimensions_shifted": data.dimensions_shifted,
+        }
+    }
+    try:
+        with httpx.Client(timeout=10.0) as http:
+            r = http.post(f"{threadwatch_url}/signals/iron-thread", json=payload)
+            success = r.status_code in (200, 201)
+            status_code = r.status_code
+    except Exception as e:
+        success = False
+        status_code = None
+
+    return {
+        "signal_sent": success,
+        "threadwatch_url": threadwatch_url,
+        "status_code": status_code,
+        "payload": payload,
+    }
+
+@app.get("/bridge/status")
+def bridge_status():
+    """Checks health of all Thread Suite tools."""
+    results = {}
+    with httpx.Client(timeout=8.0) as http:
+        for tool, url in THREAD_SUITE_URLS.items():
+            try:
+                r = http.get(f"{url}/health")
+                results[tool] = {
+                    "status": "online" if r.status_code == 200 else "error",
+                    "url": url,
+                }
+            except Exception:
+                results[tool] = {"status": "offline", "url": url}
+    return {"suite_status": results}

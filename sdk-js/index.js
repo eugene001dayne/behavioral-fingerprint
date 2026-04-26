@@ -71,6 +71,18 @@ class BehavioralFingerprint {
   captureFingerprintWithBattery(agentId, batteryId) {
     return this._req("POST", `/fingerprint/${agentId}/battery/${batteryId}`);
   }
+
+  // ThreadWatch bridge
+  sendToThreadwatch(agentId, driftRecordId, severity, mahalanobisDistance, dimensionsShifted) {
+    return this._req("POST", "/bridge/threadwatch", {
+      agent_id: agentId,
+      drift_record_id: driftRecordId,
+      severity,
+      mahalanobis_distance: mahalanobisDistance,
+      dimensions_shifted: dimensionsShifted,
+    });
+  }
+  bridgeStatus() { return this._req("GET", "/bridge/status"); }
 }
 
 module.exports = BehavioralFingerprint;

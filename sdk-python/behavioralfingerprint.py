@@ -113,3 +113,17 @@ class BehavioralFingerprint:
 
     def capture_fingerprint_with_battery(self, agent_id: str, battery_id: str):
         return self._req("POST", f"/fingerprint/{agent_id}/battery/{battery_id}")
+
+# ThreadWatch bridge
+    def send_to_threadwatch(self, agent_id: str, drift_record_id: str, severity: str,
+                             mahalanobis_distance: float, dimensions_shifted: list):
+        return self._req("POST", "/bridge/threadwatch", json={
+            "agent_id": agent_id,
+            "drift_record_id": drift_record_id,
+            "severity": severity,
+            "mahalanobis_distance": mahalanobis_distance,
+            "dimensions_shifted": dimensions_shifted,
+        })
+
+    def bridge_status(self):
+        return self._req("GET", "/bridge/status")
