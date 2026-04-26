@@ -32,7 +32,7 @@ def get_client():
 app = FastAPI(
     title="Behavioral Fingerprint",
     description="Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time.",
-    version="0.4.0"
+    version="0.5.0"
 )
 
 app.add_middleware(
@@ -305,7 +305,7 @@ class AgentUpdate(BaseModel):
 def root():
     return {
         "tool": "Behavioral Fingerprint",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "status": "running",
         "description": "Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time."
     }
@@ -1047,4 +1047,127 @@ def get_schedule(agent_id: str):
         "schedule_enabled": agent.get("schedule_enabled", False),
         "last_scheduled_run": agent.get("last_scheduled_run"),
         "next_run": str(job.next_run_time) if job else None,
+    }
+
+# ── CUSTOM PROBE BATTERIES ───────────────
+
+class ProbeItem(BaseModel):
+    probe_id: str
+    dimension: str
+    category: Optional[str] = ""
+    input_text: str
+
+class BatteryCreate(BaseModel):
+    name: str
+    version: Optional[str] = "1.0.0"
+    description: Optional[str] = None
+    probes: List[ProbeItem]
+
+@app.post("/batteries")
+def create_battery(data: BatteryCreate):
+    if len(data.probes) < 6:
+        raise HTTPException(status_code=400, detail="Battery must have at least 6 probes.")
+    valid_dimensions = {"verbosity", "hedging", "refusal", "confidence", "consistency", "adherence"}
+    for probe in data.probes:
+        if probe.dimension not in valid_dimensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid dimension '{probe.dimension}'. Must be one of: {', '.join(valid_dimensions)}"
+            )
+    probes_list = [p.dict() for p in data.probes]
+    with get_client() as client:
+        r = client.post("/probe_batteries", json={
+            "name": data.name,
+            "version": data.version,
+            "description": data.description,
+            "probes": probes_list,
+            "probe_count": len(probes_list),
+        })
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=400, detail=r.text)
+    return r.json()[0] if isinstance(r.json(), list) else r.json()
+
+@app.post("/fingerprint/{agent_id}/battery/{battery_id}")
+def capture_fingerprint_with_battery(agent_id: str, battery_id: str):
+    """
+    Runs a specific probe battery against the agent.
+    Useful for domain-specific fingerprinting beyond the default battery.
+    """
+    # Fetch agent
+    with get_client() as client:
+        r = client.get(f"/agent_profiles?agent_id=eq.{agent_id}")
+    agents = r.json()
+    if not agents:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = agents[0]
+    endpoint_url = agent["endpoint_url"]
+
+    # Fetch battery
+    with get_client() as client:
+        r = client.get(f"/probe_batteries?id=eq.{battery_id}")
+    batteries = r.json()
+    if not batteries:
+        raise HTTPException(status_code=404, detail="Battery not found")
+    battery = batteries[0]
+    probes = battery["probes"]
+
+    # Run probes
+    probe_results = []
+    errors = []
+    with httpx.Client(timeout=30.0) as http:
+        for probe in probes:
+            try:
+                resp = http.post(endpoint_url, json={"input": probe["input_text"]})
+                if resp.status_code == 200:
+                    body = resp.json()
+                    output = (
+                        body.get("output") or body.get("response")
+                        or body.get("result") or body.get("content")
+                        or str(body)
+                    )
+                else:
+                    output = f"[HTTP {resp.status_code}]"
+            except Exception as e:
+                output = f"[Error: {str(e)[:100]}]"
+                errors.append(probe["probe_id"])
+
+            probe_results.append({
+                "probe_id": probe["probe_id"],
+                "dimension": probe["dimension"],
+                "category": probe.get("category", ""),
+                "input_text": probe["input_text"],
+                "output_text": output,
+            })
+
+    scores = compute_fingerprint_scores(probe_results)
+
+    fingerprint_record = {
+        "agent_id": agent_id,
+        "battery_id": battery_id,
+        "verbosity_score": scores["verbosity_score"],
+        "hedging_rate": scores["hedging_rate"],
+        "refusal_rate": scores["refusal_rate"],
+        "confidence_score": scores["confidence_score"],
+        "consistency_score": scores["consistency_score"],
+        "adherence_score": scores["adherence_score"],
+        "raw_results": probe_results,
+        "probe_count": len(probes),
+    }
+
+    with get_client() as client:
+        r = client.post("/fingerprints", json=fingerprint_record)
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=f"Failed to store fingerprint: {r.text}")
+
+    stored = r.json()[0] if isinstance(r.json(), list) else r.json()
+
+    return {
+        "fingerprint_id": stored["id"],
+        "agent_id": agent_id,
+        "battery_id": battery_id,
+        "battery_name": battery["name"],
+        "captured_at": stored["captured_at"],
+        "probe_count": len(probes),
+        "errors_on_probes": errors,
+        "scores": scores,
     }

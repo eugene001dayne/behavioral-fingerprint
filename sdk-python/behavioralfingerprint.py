@@ -103,3 +103,13 @@ class BehavioralFingerprint:
 
     def get_schedule(self, agent_id: str):
         return self._req("GET", f"/agents/{agent_id}/schedule")
+
+# Custom batteries
+    def create_battery(self, name: str, probes: list, version: str = "1.0.0", description: str = None):
+        return self._req("POST", "/batteries", json={
+            "name": name, "version": version,
+            "description": description, "probes": probes,
+        })
+
+    def capture_fingerprint_with_battery(self, agent_id: str, battery_id: str):
+        return self._req("POST", f"/fingerprint/{agent_id}/battery/{battery_id}")

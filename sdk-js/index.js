@@ -63,6 +63,14 @@ class BehavioralFingerprint {
     });
   }
   getSchedule(agentId) { return this._req("GET", `/agents/${agentId}/schedule`); }
+
+  // Custom batteries
+  createBattery(name, probes, version = "1.0.0", description = null) {
+    return this._req("POST", "/batteries", { name, version, description, probes });
+  }
+  captureFingerprintWithBattery(agentId, batteryId) {
+    return this._req("POST", `/fingerprint/${agentId}/battery/${batteryId}`);
+  }
 }
 
 module.exports = BehavioralFingerprint;
