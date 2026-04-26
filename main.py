@@ -9,8 +9,12 @@ import math
 import json
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 load_dotenv()
+scheduler = BackgroundScheduler()
+scheduler.start()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -28,7 +32,7 @@ def get_client():
 app = FastAPI(
     title="Behavioral Fingerprint",
     description="Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time.",
-    version="0.3.0"
+    version="0.4.0"
 )
 
 app.add_middleware(
@@ -301,7 +305,7 @@ class AgentUpdate(BaseModel):
 def root():
     return {
         "tool": "Behavioral Fingerprint",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "status": "running",
         "description": "Capture how your AI agent behaves at deployment. Monitor how that behavior changes over time."
     }
@@ -809,3 +813,238 @@ def acknowledge_alert(alert_id: str):
             "acknowledged": True,
         })
     return {"acknowledged": True}
+
+# ── SCHEDULED FINGERPRINTING ─────────────
+
+SCHEDULE_INTERVALS = {
+    "hourly": {"hours": 1},
+    "daily": {"days": 1},
+    "weekly": {"weeks": 1},
+}
+
+def run_scheduled_fingerprint(agent_id: str):
+    """
+    Runs automatically on schedule. Captures a new fingerprint,
+    then compares it against the previous one. Drift alerts fire
+    automatically if drift is detected.
+    """
+    try:
+        # Get agent
+        with get_client() as client:
+            r = client.get(f"/agent_profiles?agent_id=eq.{agent_id}")
+        agents = r.json()
+        if not agents:
+            return
+        agent = agents[0]
+        endpoint_url = agent["endpoint_url"]
+
+        # Get battery
+        with get_client() as client:
+            r = client.get("/probe_batteries?name=eq.Default%20Behavioral%20Probe%20Battery&version=eq.1.0.0")
+            batteries = r.json()
+            if not batteries:
+                return
+            battery = batteries[0]
+
+        battery_id = battery["id"]
+        probes = battery["probes"]
+
+        # Run probes
+        probe_results = []
+        with httpx.Client(timeout=30.0) as http:
+            for probe in probes:
+                try:
+                    resp = http.post(endpoint_url, json={"input": probe["input_text"]})
+                    if resp.status_code == 200:
+                        body = resp.json()
+                        output = (
+                            body.get("output") or body.get("response")
+                            or body.get("result") or body.get("content")
+                            or str(body)
+                        )
+                    else:
+                        output = f"[HTTP {resp.status_code}]"
+                except Exception as e:
+                    output = f"[Error: {str(e)[:100]}]"
+
+                probe_results.append({
+                    "probe_id": probe["probe_id"],
+                    "dimension": probe["dimension"],
+                    "category": probe.get("category", ""),
+                    "input_text": probe["input_text"],
+                    "output_text": output,
+                })
+
+        scores = compute_fingerprint_scores(probe_results)
+
+        fingerprint_record = {
+            "agent_id": agent_id,
+            "battery_id": battery_id,
+            "verbosity_score": scores["verbosity_score"],
+            "hedging_rate": scores["hedging_rate"],
+            "refusal_rate": scores["refusal_rate"],
+            "confidence_score": scores["confidence_score"],
+            "consistency_score": scores["consistency_score"],
+            "adherence_score": scores["adherence_score"],
+            "raw_results": probe_results,
+            "probe_count": len(probes),
+        }
+
+        with get_client() as client:
+            r = client.post("/fingerprints", json=fingerprint_record)
+        if r.status_code not in (200, 201):
+            return
+
+        new_fp = r.json()[0] if isinstance(r.json(), list) else r.json()
+        new_fp_id = new_fp["id"]
+
+        # Update last_scheduled_run
+        with get_client() as client:
+            client.patch(
+                f"/agent_profiles?agent_id=eq.{agent_id}",
+                json={"last_scheduled_run": datetime.now(timezone.utc).isoformat()}
+            )
+
+        # Compare against previous fingerprint
+        with get_client() as client:
+            r = client.get(
+                f"/fingerprints?agent_id=eq.{agent_id}&order=captured_at.desc&limit=2"
+            )
+        fps = r.json()
+        if len(fps) < 2:
+            return
+
+        prev_fp = fps[1]  # second most recent
+
+        # Compute deltas
+        a, b = prev_fp, new_fp
+        verbosity_delta   = compute_delta(a["verbosity_score"],   b["verbosity_score"])
+        hedging_delta     = compute_delta(a["hedging_rate"],      b["hedging_rate"])
+        refusal_delta     = compute_delta(a["refusal_rate"],      b["refusal_rate"])
+        confidence_delta  = compute_delta(a["confidence_score"],  b["confidence_score"])
+        consistency_delta = compute_delta(a["consistency_score"], b["consistency_score"])
+        adherence_delta   = compute_delta(a["adherence_score"],   b["adherence_score"])
+
+        deltas = [
+            verbosity_delta, hedging_delta, refusal_delta,
+            confidence_delta, consistency_delta, adherence_delta
+        ]
+
+        distance = compute_mahalanobis(deltas)
+        drift_detected, severity = classify_severity(distance)
+
+        drift_record = {
+            "agent_id": agent_id,
+            "fingerprint_a_id": prev_fp["id"],
+            "fingerprint_b_id": new_fp_id,
+            "verbosity_delta":   verbosity_delta,
+            "hedging_delta":     hedging_delta,
+            "refusal_delta":     refusal_delta,
+            "confidence_delta":  confidence_delta,
+            "consistency_delta": consistency_delta,
+            "adherence_delta":   adherence_delta,
+            "mahalanobis_distance": distance,
+            "drift_detected": drift_detected,
+            "severity": severity,
+        }
+
+        with get_client() as client:
+            r = client.post("/drift_records", json=drift_record)
+        if r.status_code not in (200, 201):
+            return
+
+        stored = r.json()[0] if isinstance(r.json(), list) else r.json()
+
+        if drift_detected:
+            dimensions_shifted = [
+                dim for dim, delta in zip(
+                    ["verbosity", "hedging", "refusal", "confidence", "consistency", "adherence"],
+                    deltas
+                ) if delta > 0
+            ]
+            alert_message = (
+                f"Scheduled fingerprint detected behavioral drift on agent '{agent_id}'. "
+                f"Severity: {severity}. Distance: {distance}. "
+                f"Dimensions shifted: {', '.join(dimensions_shifted)}."
+            )
+            alert_record = {
+                "agent_id": agent_id,
+                "drift_record_id": stored["id"],
+                "dimensions_shifted": dimensions_shifted,
+                "message": alert_message,
+                "severity": severity,
+                "acknowledged": False,
+            }
+            with get_client() as client:
+                alert_r = client.post("/drift_alerts", json=alert_record)
+            if alert_r.status_code in (200, 201):
+                alert_data = alert_r.json()
+                alert = alert_data[0] if isinstance(alert_data, list) else alert_data
+                fire_webhooks(agent_id, {
+                    "drift_record_id": stored["id"],
+                    "severity": severity,
+                    "mahalanobis_distance": distance,
+                    "compared_at": stored["created_at"],
+                }, alert["id"], dimensions_shifted)
+
+    except Exception:
+        pass  # never crash the scheduler
+
+class ScheduleRequest(BaseModel):
+    schedule: str
+    schedule_enabled: bool = True
+
+@app.post("/agents/{agent_id}/schedule")
+def set_schedule(agent_id: str, data: ScheduleRequest):
+    if data.schedule not in SCHEDULE_INTERVALS:
+        raise HTTPException(status_code=400, detail="schedule must be hourly, daily, or weekly")
+
+    # Upsert agent schedule in database
+    with get_client() as client:
+        r = client.patch(
+            f"/agent_profiles?agent_id=eq.{agent_id}",
+            json={"schedule": data.schedule, "schedule_enabled": data.schedule_enabled}
+        )
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=400, detail=r.text)
+
+    # Remove existing job for this agent if any
+    job_id = f"fingerprint_{agent_id}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+    # Add new job if enabled
+    if data.schedule_enabled:
+        interval = SCHEDULE_INTERVALS[data.schedule]
+        scheduler.add_job(
+            run_scheduled_fingerprint,
+            IntervalTrigger(**interval),
+            args=[agent_id],
+            id=job_id,
+            replace_existing=True,
+        )
+
+    return {
+        "agent_id": agent_id,
+        "schedule": data.schedule,
+        "schedule_enabled": data.schedule_enabled,
+        "message": f"Schedule set to {data.schedule}. Fingerprints will be captured and compared automatically."
+    }
+
+@app.get("/agents/{agent_id}/schedule")
+def get_schedule(agent_id: str):
+    with get_client() as client:
+        r = client.get(f"/agent_profiles?agent_id=eq.{agent_id}")
+    agents = r.json()
+    if not agents:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = agents[0]
+    job_id = f"fingerprint_{agent_id}"
+    job = scheduler.get_job(job_id)
+    return {
+        "agent_id": agent_id,
+        "schedule": agent.get("schedule"),
+        "schedule_enabled": agent.get("schedule_enabled", False),
+        "last_scheduled_run": agent.get("last_scheduled_run"),
+        "next_run": str(job.next_run_time) if job else None,
+    }

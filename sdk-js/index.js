@@ -55,6 +55,14 @@ class BehavioralFingerprint {
   // Alerts
   listAlerts(agentId) { return this._req("GET", `/alerts/${agentId}`); }
   acknowledgeAlert(alertId) { return this._req("PATCH", `/alerts/${alertId}/acknowledge`); }
+
+  // Scheduling
+  setSchedule(agentId, schedule, scheduleEnabled = true) {
+    return this._req("POST", `/agents/${agentId}/schedule`, {
+      schedule, schedule_enabled: scheduleEnabled
+    });
+  }
+  getSchedule(agentId) { return this._req("GET", `/agents/${agentId}/schedule`); }
 }
 
 module.exports = BehavioralFingerprint;

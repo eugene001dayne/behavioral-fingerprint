@@ -93,3 +93,13 @@ class BehavioralFingerprint:
 
     def acknowledge_alert(self, alert_id: str):
         return self._req("PATCH", f"/alerts/{alert_id}/acknowledge")
+
+# Scheduling
+    def set_schedule(self, agent_id: str, schedule: str, schedule_enabled: bool = True):
+        return self._req("POST", f"/agents/{agent_id}/schedule", json={
+            "schedule": schedule,
+            "schedule_enabled": schedule_enabled,
+        })
+
+    def get_schedule(self, agent_id: str):
+        return self._req("GET", f"/agents/{agent_id}/schedule")
